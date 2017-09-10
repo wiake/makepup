@@ -1,0 +1,653 @@
+#!/bin/bash
+# Program: makepup by wiak (of murga-linux puppy forum)
+# version: 0.0.8
+# Description: Using sed methods to dynamically modify/answer
+# existing scripts without needing 'tcl expect' package. More
+# particularly, the method is here used to auto-build a woof-CE Puppy.
+# Program/method copyright wiak 22Aug2017+
+# License: MIT (aka X11 license)
+# Change log:
+## 0.0.1 first version
+## 0.0.2
+# Default config now uses woof-CE-rationalise rather than woof-CE-testing
+# Now auto-creates config files and uses them. Removed options --makeconfig and --config since no longer required.
+# makepup commandline options now override the hard-coded defaults and/or those in the makepup.conf file.
+# Added -p/--pause option to pause script to allow editing of makepup_extra.conf for adding extra packages available from woof-CE
+## 0.0.3 Added -R/--REBUILDALL option, which forces rebuild (post-install scripts etc) of ALL_PACKAGES rather than default CHANGED_ONLY
+#  Fixed -k/--keepbranch option so the branch doesn't need to be re-downloaded if this commandline switch is given
+## 0.0.4 Per issue saintless had I used wget with --no-check-certificate and forced output file name with -O
+## 0.0.5 Arranged for support/rootfs-packages.conf (extra-packages) to by default automatically vary with distro/version choice chosen
+#  Added -E/--EXTRACONF to use makepup_extra.conf, if exists, to overwrite rootfs-packages.conf extra packages
+#  Changed previous option -K/--KERNEL to -H/--HUGEKERNEL for numeric hugekernel choice
+#  Option -K is now used as -K/--KEEPKERNEL to force reuse of the previous hugekernel
+#              (which was usually auto-stored as local-repositories/huge_kernels file)
+#  Added -T/--THEMESGUI to optionally allow 3builddistro-Z 'Choose Themes' gui to pop-up during the otherwise non-interactive run
+#  Added -X/--XPOPUPGUI to optionally allow 3builddistro-Z 'extra-packages' gui chooser to pop-up during the otherwise non-interactive run
+## 0.0.6 Per my woof-CE github request, huge-kernels now correctly archived in local-repositories so don't need to be re-downloaded once fetched. Function huge-kernel-mod thus altered here to take into account the new difference in rationalise and testing branches.
+#  No longer need option -K/--KEEPKERNEL, so removed it since woof-CE now automatically saves and uses chosen archived kernels from local-repositories/huge_kernels/. Still using option -H/--HUGEKERNEL for chosing kernel to use in build though.
+## 0.0.7 Now with simple gtkdialog settings gui. To access this, simply run: ./makepup --gui (or ./makepup -g).
+#  Added gettext strings to gui
+## 0.0.8 Minor bug fixes
+
+trap ontrap INT TERM ERR EXIT
+
+export TEXTDOMAIN=makepup
+export OUTPUT_CHARSET=UTF-8
+. gettext.sh
+
+programversion="0.0.8"
+mkdir -p /tmp/makepup/
+
+KERNEL_REPO_URL=${KERNEL_REPO_URL:-http://distro.ibiblio.org/puppylinux/huge_kernels}
+
+# Default config:
+nTARGETARCH="2"              # i.e. target is x86 (1=arm, 2=x86, 3=x86_64)
+nCOMPATDISTRO="3"            # i.e. distro is slackware (1=debian, 2=devuan, 3=slackware, 4=trisquel, 5=ubuntu)
+nCOMPATVERSION="3"           # i.e. release version is 14.2 (1=14.0, 2=14.1, 3=14.2)
+WOOFBRANCH="woof-CE-testing" # woofbranch, e.g. woof-CE-testing
+nHUGEKERNEL="24"             # i.e. hugekernel to use is huge-4.4.70-s32-700_PAE
+INTERACTIVE="false"          # "true" means: Require user input during the build
+gui="false"                  # "true" means: Use gui frontend (wiak remove comment when done: gui not yet implemented)
+KEEPBRANCH="true"            # "true" means: Keep previous woofbranch zip-file and woof-CE-branch directory
+PAUSE="false"                # "true" means: pause makepup script just after merge2out routine to allow package selection changes
+DEVX="false"                 # "true" means: Create DEVX sfs
+REBUILDALL="false"           # i.e. rebuild changed packages only. Alternative, for now, is "true" for ALL_PACKAGES.
+POPUPTHEMES="false"          # "true" means: Pop-up 'choose themes' gui during the final 3builddistro-Z process
+POPUPEXTRA="false"           # "true" means: Pop-up 'choose extra packages' gui during the final 3builddistro-Z process
+EXTRACONF="true"             # "true" means: use makepup_extra.conf, if exists, to overwrite rootfs-packages.conf extra packages.
+
+ontrap (){
+ [ -e "support/huge_kernel.shBKUP" ] && cp -af support/huge_kernel.shBKUP support/huge_kernel.sh
+ [ -e "support/choose_themesBKUP" ] && cp -af support/choose_themesBKUP support/choose_themes
+ rm -rf /tmp/makepup/
+ exit 1
+}
+
+makepupextraconf (){
+ [ -e support/rootfs-packages.conf ] && rm -f support/rootfs-packages.conf
+ sleep 1 # maybe remove, or adjust duration
+ for d in $(ls rootfs-packages)
+ do
+  LIST="sfs_load|pfilesearch|pfind|firewall_ng|simple_network_setup"
+  echo "$d" | egrep -q "$LIST" && printf "$d=\"true\"\n" >> support/rootfs-packages.conf || printf "$d=\"false\"\n" >> support/rootfs-packages.conf
+  case "$d" in
+    mscw|sfs_load|pgprs|change_kernels|network_wizard|frisbee)
+      printf "$d=\"true\"\n" >> support/rootfs-packages.conf ;;
+    lxde_menu_support)
+      grep -q 'yes|pcmanfm' DISTRO_PKGS_SPECS-${DISTRO_BINARY_COMPAT}-${DISTRO_COMPAT_VERSION} && \
+        printf "$d=\"true\"\n" >> support/rootfs-packages.conf
+    ;;
+    jwm_config|ptheme|ptheme_buntoo)
+     if grep 'jwmconfig' DISTRO_PKGS_SPECS-${DISTRO_BINARY_COMPAT}-${DISTRO_COMPAT_VERSION} | \
+       grep -q '^yes' ;then
+         : #cant choose them if jwmconfig is in specs.
+     else
+       printf "$d=\"true\"\n" >> support/rootfs-packages.conf
+     fi
+    ;;
+    wallpaper)
+      if grep -q 'yes|wallpaper' DISTRO_PKGS_SPECS-${DISTRO_BINARY_COMPAT}-${DISTRO_COMPAT_VERSION};then
+        : # don't overwrite user chosen specs
+      else 
+        printf "$d=\"true\"\n" >> support/rootfs-packages.conf
+      fi
+    ;;
+    pmusic)
+      if grep -q 'yes|ffmpeg' DISTRO_PKGS_SPECS-${DISTRO_BINARY_COMPAT}-${DISTRO_COMPAT_VERSION};then
+        printf "$d=\"true\"\n" >> support/rootfs-packages.conf
+      else 
+        :
+      fi # depends ffmpeg
+    ;;	
+    cups_backend) # contains the backends smbw and pdf-writer
+      if grep -q 'yes|cups|' DISTRO_PKGS_SPECS-${DISTRO_BINARY_COMPAT}-${DISTRO_COMPAT_VERSION};then
+        if [ "${DISTRO_BINARY_COMPAT}" = 'slackware64' ];then
+          :
+        else
+          printf "$d=\"true\"\n" >> support/rootfs-packages.conf
+        fi
+      else 
+        :
+      fi # depends cups and anything BUT slackware64 binary compat
+    ;;		
+    cups_backend64) # contains the backends smbw and pdf-writer
+      if grep -q 'yes|cups|' DISTRO_PKGS_SPECS-${DISTRO_BINARY_COMPAT}-${DISTRO_COMPAT_VERSION};then
+        if [ "${DISTRO_BINARY_COMPAT}" = 'slackware64' ];then
+          printf "$d=\"true\"\n" >> support/rootfs-packages.conf
+        else
+          :
+        fi
+      else 
+        :
+      fi # depends cups AND slackware64 binary compat
+    ;;		
+    pmirror)
+      if grep -q 'yes|mirdir' DISTRO_PKGS_SPECS-${DISTRO_BINARY_COMPAT}-${DISTRO_COMPAT_VERSION};then
+        printf "$d=\"true\"\n" >> support/rootfs-packages.conf
+      else 
+        :
+      fi #depends mirdir
+    ;;		
+    [f|F]risbee)
+      if grep -q 'yes|wpa_supplicant' DISTRO_PKGS_SPECS-${DISTRO_BINARY_COMPAT}-${DISTRO_COMPAT_VERSION};then
+        if grep -E "[f|F]risbee" DISTRO_PKGS_SPECS-${DISTRO_BINARY_COMPAT}-${DISTRO_COMPAT_VERSION} |\
+          grep -q '^yes' ;then
+            : # don't overwrite user chosen specs
+        else
+          printf "$d=\"true\"\n" >> support/rootfs-packages.conf
+        fi
+      else 
+        :
+      fi #depends wpa_supplicant
+    ;;
+    grub2_efi64)
+      [ "$UFEI_ISO" = "yes" ] && printf "$d=\"true\"\n" >> support/rootfs-packages.conf
+    ;;
+    *)
+      if grep "|${d}" DISTRO_PKGS_SPECS-${DISTRO_BINARY_COMPAT}-${DISTRO_COMPAT_VERSION} |\
+        grep -q '^yes' ;then
+          : # don't overwrite user chosen specs
+      fi
+    ;;
+  esac
+ done
+}
+
+makepupconf (){
+ if [ ! -e ./makepup.conf ];then
+  printf "nTARGETARCH=\"$nTARGETARCH\"
+nCOMPATDISTRO=\"$nCOMPATDISTRO\"
+nCOMPATVERSION=\"$nCOMPATVERSION\"
+WOOFBRANCH=\"$WOOFBRANCH\"
+DEVX=\"$DEVX\"
+INTERACTIVE=\"$INTERACTIVE\"
+gui=\"$gui\"
+KEEPBRANCH=\"$KEEPBRANCH\"
+nHUGEKERNEL=\"$nHUGEKERNEL\"
+PAUSE=\"false\"
+REBUILDALL=\"false\"
+POPUPTHEMES=\"false\"
+POPUPEXTRA=\"false\"
+" >makepup.conf
+ fi
+}
+
+pause4adding_packages (){
+ if [ "$PAUSE" = "true" ];then
+  printf "
+
+You can now view/edit the 'DISTRO_PKGS_SPECS-<distro-version> file'
+to choose extra packages for including in the core build.
+To do this, change those you want that have 'no' before their name
+to 'yes'.
+In particular, you might want to add extra 'firmware'.
+Once the core build is complete some extra packages are added
+later in the build process from the contents of
+support/rootfs-packages.conf. You can also edit that now
+if you want.
+
+Once finished, enter y to continue, any other key to quit: "
+  go_choice
+ fi
+}
+
+usage () {
+ printf >&2 \
+"
+usage: $0 [-DEghikpRTv] [-t nTARGETARCH] [-d nCOMPATDISTRO] \\
+      [-r nCOMPATVERSION] [-w WOOFBRANCH] [-K nHUGEKERNEL]
+
+Accepts longoptions or short options and
+grouped short options (e.g. -igd ubuntu or -igdubuntu)
+
+Options (short/long) are: 
+-t/--target (numeric TARGETARCH choice. e.g. 2 for x86)
+-d/--distro (numeric COMPATDISTRO choice. e.g. 3 for slackware)
+-r/--release (numeric COMPATVERSION choice. e.g. 3 for version 14.2)
+-w/--woofbranch (WOOFBRANCH
+                 e.g. woof-CE-testing or woof-CE-rationalise)
+-H/--HUGEKERNEL (numeric HUGEKERNEL choice.
+             e.g. 24 for huge-4.4.70-s32-700_PAE)
+-D/--DEVX (Make DEVX sfs file. Default is false)
+-E/--EXTRACONF (use makepup_extra.conf extra-package list, if exists)
+-g/--gui (Run with gui frontend helper, otherwise commandline only - planned)
+-h/--help (provide help usage)
+-i/--interactive (Ask questions during run, 
+                  otherwise non-interactive.
+                  Default is non-interactive)
+-k/--keepbranch (Keep previous woofbranch zip file and directory.
+                 Default is to keep, so won't need re-downloaded)
+-p/--pause (pauses makepup script just after merge2out routine.
+           DISTRO_PKGS_SPECS-distro-version is ready for
+           reading at this stage if you want to see what
+           packages are available via woof-CE. For convenience,
+           a copy of that file is made in same directory as the
+           makepup script. Only those with 'no' before their
+           name can be added, if desired, to makepup_extra.conf
+           Those with 'yes' are already included in core build
+           In particular, you might want to add extra 'firmware').
+-X/--XPOPUPGUI (Pop-up 'choose extra packages' gui during
+              the final 3builddistro-Z process)
+-R/--REBUILDALL (forces rebuild/post-install etc...
+                 of ALL_PACKAGES.
+                 By default makepup rebuilds CHANGED_ONLY packages) 
+-T/--THEMESGUI (Pop-up 'choose themes' gui during
+              the final 3builddistro-Z process)
+-v/--version (show release version)
+
+"
+}
+
+combobox_list () {
+ comboitems=""
+ for each_item in $@; do
+  comboitems="${comboitems}<item>\"$each_item\"</item>"
+ done
+ printf "$comboitems"
+}
+
+hugekernel_list() {
+ kernelrawlist=/tmp/makepup/kernelrawlist$$
+ kernelcleanedlist=/tmp/makepup/kernelcleanedlist$$
+ wget ${KERNEL_REPO_URL} -O $kernelrawlist
+ [ $? -ne 0 ] && { printf "\nHuge_kernel list download unsuccessful.\nCheck your internet connection and try running makepup again,\nor try later.\n\n"; exit 5; }
+ n=1
+ for kernel in \
+  $(sed '/md5/d
+         /kernels/d
+        s/.*td.*href.*huge/huge/
+        s/<\/a><\/td.*//' "$kernelrawlist" | grep 'huge')
+ do
+  printf "${n}:${kernel}\n" >> $kernelcleanedlist
+  n=$(($n + 1))
+ done
+ DEFAULT_ITEM="$(cat "$kernelcleanedlist" | grep "${nHUGEKERNEL}:")"
+ HKERNEL_ITEMS="<item>\"$DEFAULT_ITEM\"</item>"
+ HKERNEL_ITEMS="${HKERNEL_ITEMS}$(combobox_list $(cat "$kernelcleanedlist" | tr '\n' ' '))"
+ rm $kernelrawlist
+ rm $kernelcleanedlist
+}
+
+simplegui () {
+export SIMPLEGUI="
+<window title=\"makepup $programversion\">
+<vbox>
+ <notebook labels=\"$(gettext 'Basic|Advanced')\">
+ <vbox>
+  <frame $(gettext 'Settings')>
+   <hbox>
+    <text><label>$(gettext 'woof-CE-branch [-w]: ')</label></text>
+    <combobox>
+     <variable>WOOFBRANCH</variable>
+      $(combobox_list woof-CE-testing woof-CE-rationalise)
+     </combobox>
+   </hbox>
+   <hbox>
+    <text><label>$(gettext 'target architecture [-t]: ')</label></text>
+	<combobox>
+     <variable>TARGETARCH</variable>
+     $(combobox_list 2:x86 1:arm 2:x86 3:x86_64)
+    </combobox>
+   </hbox>
+   <hbox>
+    <text><label>$(gettext 'distro base [-d]: ')</label></text>
+    <combobox>  
+     <variable>COMPATDISTRO</variable>
+     $(combobox_list 3:slackware 1:debian 2:devuan 3:slackware 4:trisquel 5:ubuntu)
+    </combobox>
+   </hbox>
+   <hbox>
+    <text><label>$(gettext 'release version [-r]: ')</label></text>
+    <combobox>  
+     <variable>COMPATVERSION</variable>
+     $(combobox_list 3:Slackware14.2 1:DebianStretch 1:DevuanAscii 1:UbuntuTahr 1:TrisquelBelenos 2:UbuntuXenial 2:Slackware14.1 2:Slackware14.0 3:Slackware14.2)
+    </combobox>
+   </hbox>
+   <hbox>
+    <text><label>$(gettext 'Huge kernel [-H]: ')</label></text>
+    <combobox>  
+     <variable>HUGEKERNEL</variable>
+     ${HKERNEL_ITEMS}
+    </combobox>
+   </hbox>
+  </frame> 
+  <hbox>
+   <text><label>$(gettext 'Check your settings and then:')</label></text>
+   <button>
+    <label>$(gettext 'Build your Pup!')</label>
+    <action type=\"exit\">BUILD</action>
+   </button>
+  </hbox>
+ </vbox>
+ <vbox>
+  <frame $(gettext 'makepup optional switches')>
+   <checkbox>
+    <label>$(gettext '[-D] also build devx')</label>
+    <variable>DEVX</variable>
+   </checkbox>
+   <checkbox>
+    <label>$(gettext '[-k] keep previous woof-CE branch')</label>
+    <variable>KEEPBRANCH</variable>
+    <default>$KEEPBRANCH</default>
+   </checkbox>
+   <checkbox>
+    <label>$(gettext '[-R] REBUILD ALL_PACKAGES (post-install scripts etc)')</label>
+    <variable>REBUILDALL</variable>
+   </checkbox>
+   <checkbox>
+    <label>$(gettext '[-T] allow pop-up "choose-THEMES" gui during build')</label>
+    <variable>POPUPTHEMES</variable>
+   </checkbox>
+   <checkbox>
+    <label>$(gettext '[-p] pause makepup soon after merge2out routine')</label>
+    <variable>PAUSE</variable>
+   </checkbox>
+   <checkbox>
+    <label>$(gettext '[i] interactive mode (like woof-CE manual build)')</label>
+    <variable>INTERACTIVE</variable>
+   </checkbox>
+   <radiobutton> 
+    <label>$(gettext 'Use woof-CE default extra rootfs-packages')</label>
+    <variable>DEFAULTEXTRA</variable>
+   </radiobutton>
+   <radiobutton> 
+    <label>$(gettext 'Use makepup_extra.conf for extra rootfs-packages')</label>
+    <variable>EXTRACONF</variable>
+   </radiobutton>
+   <radiobutton> 
+    <label>$(gettext 'allow pop-up "choose extra rootfs-packages" gui')</label>
+    <variable>POPUPEXTRA</variable>
+   </radiobutton>
+  </frame>
+  <hbox>
+   <text><label>$(gettext 'Check your settings and then:')  </label></text>
+   <button>
+    <label>$(gettext 'Build your Pup!')</label>
+    <action type=\"exit\">BUILD</action>
+   </button>
+  </hbox>
+ </vbox>
+ </notebook>
+ <hbox>
+  <button><label>$(gettext 'QUIT')</label></button>
+ </hbox>
+</vbox>
+</window>
+"
+ gtkdialog3 --center --program=SIMPLEGUI >/tmp/makepup/makepup_settings
+ . /tmp/makepup/makepup_settings
+ if [ "$EXIT" = "BUILD" ];then
+  nTARGETARCH="${TARGETARCH%%:*}"
+  nCOMPATDISTRO="${COMPATDISTRO%%:*}"
+  nCOMPATVERSION="${COMPATVERSION%%:*}"
+  nHUGEKERNEL="${HUGEKERNEL%%:*}"
+ else
+  printf "\nQuit option chosen in makepup gui\n"
+  exit 0
+ fi
+}
+
+showgui (){
+ hugekernel_list
+ simplegui
+}
+
+cmdargs () {
+ while [[ ${1:0:1} = '-' ]] ; do
+  if [[ ${1:1:1} = '-' ]];then
+   case "${1:2:1}" in
+      'd') nCOMPATDISTRO="${2}"; shift ;;
+      'D') DEVX="true" ;;
+      'E') EXTRACONF="true" ;;
+      'g') gui="true" ;;
+      'H') nHUGEKERNEL="${2}"; shift ;;
+      'i') INTERACTIVE="true" ;;
+      'k') KEEPBRANCH="false" ;;      
+      'p') PAUSE="true" ;;
+      'r') nCOMPATVERSION="${2}"; shift ;;
+      'R') REBUILDALL="true" ;; 
+      't') nTARGETARCH="${2}"; shift ;;
+      'T') POPUPTHEMES="true" ;;
+      'v') printf "\n$0 version $programversion\n"; exit 0;;
+      'w') WOOFBRANCH="${2}"; shift ;;
+      'X') POPUPEXTRA="true" ;;
+      *) usage
+         exit 1 ;;
+   esac
+  else
+   argvlen=${#1}
+   nchars=1
+   while [ $nchars -lt $argvlen ] ; do
+    case ${1:$nchars:1} in
+      'd') nCOMPATDISTRO="${2}"; shift ;;
+      'D') DEVX="true" ;;
+      'E') EXTRACONF="true" ;;
+      'g') gui="true" ;;
+      'H') nHUGEKERNEL="${2}"; shift ;;
+      'i') INTERACTIVE="true" ;;
+      'k') KEEPBRANCH="false" ;;      
+      'p') PAUSE="true" ;;
+      'r') nCOMPATVERSION="${2}"; shift ;;
+      'R') REBUILDALL="true" ;; 
+      't') nTARGETARCH="${2}"; shift ;;
+      'T') POPUPTHEMES="true" ;;
+      'v') printf "\n$0 version $programversion\n"; exit 0;;
+      'w') WOOFBRANCH="${2}"; shift ;;
+      'X') POPUPEXTRA="true" ;;
+      *) usage
+         exit 1 ;;
+    esac
+    nchars=$(($nchars+1))
+   done
+  fi
+  shift
+ done
+}
+
+go_choice (){
+ read choice
+ case "$choice" in
+  y|Y|yes|YES) : ;;
+    *) exit 0 ;;
+ esac
+}	
+
+fetchwoof (){
+ woofclonefile="$(printf "%s" "$WOOFBRANCH".zip | sed 's\woof-CE-\\g')"
+ printf '
+NOTE WELL!!! Unless option -k[--keepbranch] is
+included on the commandline, any existing
+woofbranch clone directory will be deleted as 
+will any previously downloaded woof-branch zip file.
+(To save download bandwidth, any local-repositories
+or woof-out_* directories are currently NOT deleted).
+
+Enter y to continue, any other key to quit: '
+  go_choice
+  printf '
+Are you sure?!
+Enter y to continue, any other key to quit: '
+  go_choice
+ if [ "$KEEPBRANCH" = "false" ]; then
+# ls woof-out_* >/dev/null 2>&1 && { printf "wait... deletion takes time\n"; rm -rf woof-out_*; }
+# ls local-repositories* >/dev/null 2>&1 && { printf "wait... deletion takes time\n"; rm -rf local-repositories*; } 
+   [ -d "${WOOFBRANCH}" ] && rm -rf "${WOOFBRANCH}"
+   [ -e "${woofclonefile}" ] && rm -f "${woofclonefile}"
+   wget -c --no-check-certificate "https://github.com/puppylinux-woof-CE/woof-CE/archive/${woofclonefile}" -O "${woofclonefile}"
+   unzip "${woofclonefile}"
+ fi
+ sleep 1 # remove maybe, or adjust duration
+ [ -d "${WOOFBRANCH}" ] && cd "${WOOFBRANCH}" || { printf "\nNo ${WOOFBRANCH} found so re-run WITHOUT option -k so woofbranch will be re-downloaded\nIf you have a makepup.conf file,\nmake sure it is valid for what you want to do\n\n"; exit 2; }
+}
+
+merge2out_mod (){
+ sed '
+/read nTARGETARCH/ c nTARGETARCH='"$nTARGETARCH"' #wiak was: read nTARGETARCH
+/read nCOMPATDISTRO/ c nCOMPATDISTRO='"$nCOMPATDISTRO"' #wiak was: read nCOMPATDISTRO
+/read nCOMPATVERSION/ c nCOMPATVERSION='"$nCOMPATVERSION"' #wiak was: read nCOMPATVERSION
+/read waitforit/ c sleep 3 #wiak was: read waitforit. You can change the sleep value to suit you.
+/read goforit/ c goforit="" #wiak was: read goforit
+' <merge2out >merge2out_wiak
+ chmod +x merge2out_wiak
+}
+
+0setup_mod (){
+ sed '
+/read zzz/ c : #wiak was: [ "$WOOF_GUI" ] && { echo -n "Press ENTER key to exit: " ; read zzz ; }
+/read downloadit/ c downloadit="" #wiak was: read downloadit
+/read skipdl/ c skipdl="" #wiak was: read skipdl
+/read enditnow/ c enditnow="" #wiak was: read enditnow
+/read DBUPDATEFLAG/ c DBUPDATEFLAG="" #wiak was: read DBUPDATEFLAG
+/read skipcheck/ c skipcheck="" #wiak was: read skipcheck
+/read yepgetout/ c yepgetout="" #wiak was: read yepgetout
+' <0setup >0setup_wiak
+ chmod +x 0setup_wiak
+}
+
+1download_mod (){
+ sed '
+/read zzz/ c : #wiak was: [ "$WOOF_GUI" ] && { echo -n "Press ENTER key to exit: " ; read zzz ; }
+/read keepgoing/ c keepgoing="" #wiak was: read keepgoing
+/read tryagain/ c tryagain="" #wiak was: read tryagain
+/read KEEPITGOING/ c KEEPITGOING="" #wiak was: read KEEPITGOING
+' <1download >1download_wiak
+ chmod +x 1download_wiak
+}
+
+2createpackages_mod (){
+ sed '
+/read USERINPUT/ c USERINPUT="" #wiak was: read USERINPUT
+/read zzz/ c : #wiak was: [ "$WOOF_GUI" ] && { echo -n "Press ENTER key to exit: " ; read zzz ; }
+' <2createpackages >2createpackages_wiak
+ chmod +x 2createpackages_wiak
+}
+
+3builddistro-Z_mod (){
+ # could implement most all this using tcl expect package (and autoexpect) instead, but big install and sed can do more...
+ sed '
+/read SDFLAG/ c SDFLAG="" #wiak was: read SDFLAG
+/read boardnum/ c boardnum=1 #wiak was: read boardnum
+/read carry_on/ c carry_on="" #wiak was: read carry_on
+/. $CHOICE/ i carry_on="" #wiak was: read carry_on
+/read isitbad/ c isitbad="" #wiak was: read isitbad
+/read goto1/ c goto1="" #wiak was: read goto1
+/read justgoon/ c : #wiak was: read justgoon
+/read wantswap/ c wantswap="" #wiak was: read wantswap
+/read buildanyway/ c buildanyway="" #wiak was: read buildanyway
+/read nonfree/ c nonfree="y" #wiak was: read nonfree
+/read writeitnow/ c writeitnow="n" #wiak was: read writeitnow
+/read sdnumber/ c sdnumber="1" #wiak was: read sdnumber
+/read sdcorrect/ c sdcorrect="" #wiak was: read sdcorrect
+/read PUPIMG1/ c PUPIMG1="" #wiak was: read PUPIMG1
+/read exitme/ c exitme="" #wiak was: read exitme
+/read compresstype/ c compresstype="2" #wiak was: read compresstype
+/read writeSD/ c writeSD="" #wiak was: read writeSD
+/read dodevx/ c dodevx='"$DEVX"' #wiak was: read dodevx
+' <3builddistro-Z >3builddistro-Z_wiak
+ chmod +x 3builddistro-Z_wiak
+}
+
+huge_kernel_mod (){
+ sed '
+/# precaution/ i \
+''mkdir -p ../../local-repositories/huge_kernels #wiak: as now used in testing huge_kernels.sh''
+/cp -f.*local-repositories\/huge_kernels.*huge_kernel/ c \
+''cp -fv ../../local-repositories/huge_kernels/${TARBALL} ../huge_kernel/ #wiak was: cp -f not cp -fv and had no slash at end''
+/cp -f.*huge_kernel.*local-repositories/ c \
+''cp -fv ../huge_kernel/${TARBALL} ../../local-repositories/huge_kernels/ #wiak was: cp -f not cp -fv and had no slash at end''
+/read choice_k/ c choice_k='"$nHUGEKERNEL"' #wiak was: read choice_k
+/read choice_k3/ c choice_k3='"$nHUGEKERNEL"' #wiak was: read choice_k3
+' <support/huge_kernel.sh >support/huge_kernel_wiak.sh
+ #wiak: above temporary until rationalise and testing branches of huge_kernels.sh get merged
+ chmod +x support/huge_kernel_wiak.sh
+ cp -af support/huge_kernel.sh support/huge_kernel.shBKUP && cp -af support/huge_kernel_wiak.sh support/huge_kernel.sh || exit 3
+}
+
+choose_themes_mod (){
+ # Bypasses support/choose-themes chooser gui
+ printf "#!/bin/bash
+BACKGROUNDIMAGE=\"\$(ls -1 rootfs-complete/usr/share/backgrounds | tr \'\\\n\' \' \' | cut -d\' \' -f1)\"
+echo BACKGROUNDIMAGE=\"\$BACKGROUNDIMAGE\"
+GTKTHEME=\"\$(ls -1 rootfs-complete/usr/share/themes/ | tr \'\\\n\' \' \' | cut -d\' \' -f1)\"
+echo GTKTHEME=\"\$GTKTHEME\"
+DESKICONS=\"\$(find rootfs-complete/usr/local/lib/X11/themes -maxdepth 1 -mindepth 1 -type d | rev | cut -f 1 -d \'/\' | rev | tr \'\\\n\' \' \' | cut -d\' \' -f1)\"
+echo DESKICONS=\"\$DESKICONS\"
+JWMTHEME=\"\$(ls -1 rootfs-complete/root/.jwm/themes/*-jwmrc | rev | cut -f 1 -d \'/\' | cut -f 2-99 -d \'-\' | rev | cut -d\' \' -f1 | tr \'\\\n\' \' \' | cut -d\' \' -f1)\"
+echo JWMTHEME=\"\$JWMTHEME\"
+OBTHEME=\"\$(ls -1 rootfs-complete/usr/share/themes | tr \'\\\n\' \' \' | cut -d\' \' -f1)\"
+echo OBTHEME=\"\$OBTHEME\"
+EXIT=\"OK\"
+echo EXIT=\"\$EXIT\"
+" >support/choose_themes_wiak.sh
+ chmod +x support/choose_themes_wiak.sh
+ cp -af support/choose_themes support/choose_themesBKUP && cp -af support/choose_themes_wiak.sh support/choose_themes || exit 3
+}
+
+if ! tty -s; then xmessage "$(printf "makepup should be run from a terminal.")"; fi
+
+makepupconf
+[ -e ./makepup.conf ] && . ./makepup.conf || { printf "\nThere is no config file in this directory\n"; exit 1; }
+cmdargs "$@" # command args override previous config info
+[ "$gui" = "true" ] && showgui # overrides makepup.conf and cmdargs
+[ "$DEVX" = "false" ] && DEVX="n" || DEVX=""
+[ "$REBUILDALL" = "false" ] && REBUILDALL="CHANGED_ONLY" || REBUILDALL="ALL_PACKAGES"
+fetchwoof
+if [ "$INTERACTIVE" = "true" ]; then # build requires user input
+ ./merge2out
+ sleep 1 # maybe remove, or adjust duration
+ cd ../woof-out_*
+ # DISTRO_PKGS_SPECS-${DISTRO_BINARY_COMPAT}-${DISTRO_COMPAT_VERSION} is ready for reading at this stage
+ # So use -p/--pause flag here to pause script here to allow manual editing of DISTRO_PKGS_SPECS.
+ pause4adding_packages 
+ sleep 1 # maybe remove, or adjust duration
+ ./0setup
+ sleep 1 # maybe remove, or adjust duration
+ ./1download
+ sleep 1 # maybe remove, or adjust duration
+ ./2createpackages
+ sleep 1 # maybe remove, or adjust duration
+ ./3builddistro-Z
+else # no user input required
+ merge2out_mod # or could implement all this using tcl expect package (and autoexpect) instead, but big install...
+ ./merge2out_wiak
+ sleep 1 # maybe remove, or adjust duration
+ cd ../woof-out_*
+ [ "$POPUPTHEMES" = "false" ] && choose_themes_mod
+ . ./DISTRO_SPECS # get DISTRO names etc 
+ if [ "$POPUPEXTRA" = "true" ]; then # pop-up extra-packages gui during 3builddistro-Z
+  [ -e support/rootfs-packages.conf ] && rm -f support/rootfs-packages.conf
+ else
+  if [ "$EXTRACONF" = "true" ]; then # use makepup_extra.conf rather than default makepupextraconf created support/rootfs-packages.conf
+   [ -e ../makepup_extra.conf ] && cp -af ../makepup_extra.conf support/rootfs-packages.conf || makepupextraconf
+  else
+   makepupextraconf
+  fi
+ fi
+ # DISTRO_PKGS_SPECS-${DISTRO_BINARY_COMPAT}-${DISTRO_COMPAT_VERSION} is ready for reading at this stage
+ # So use -p/--pause flag here to pause script here to allow manual editing of  DISTRO_PKGS_SPECS.
+ pause4adding_packages
+ 0setup_mod
+ 1download_mod
+ 2createpackages_mod
+ 3builddistro-Z_mod
+ [ -e support/huge_kernel.sh ] && huge_kernel_mod # comment out this line if you want to interrupt build and just choose kernel manually
+ sleep 1 # maybe remove, or adjust duration
+ ./0setup_wiak
+ sleep 1 # maybe remove, or adjust duration
+ ./1download_wiak
+ sleep 1 # maybe remove, or adjust duration
+ ./2createpackages_wiak "$REBUILDALL"
+ sleep 1 # maybe remove, or adjust duration
+ ./3builddistro-Z_wiak
+fi
+printf '
+"makepup script is now finished.
+You can find created pup (frugal files) in
+directory woof-out_<distro>/sandbox3/build and a bootable iso file
+in directory woof-out_<distro>/woof-output-<derived_distro>
+'
+[ -e "support/huge_kernel.shBKUP" ] && cp -af support/huge_kernel.shBKUP support/huge_kernel.sh
+[ -e "support/choose_themesBKUP" ] && cp -af support/choose_themesBKUP support/choose_themes
+rm -rf /tmp/makepup/
+exit 0
+# END OF MAIN SCRIPT
